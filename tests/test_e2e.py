@@ -1,5 +1,5 @@
 """
-FormGuard End-to-End Tests
+FormGuard End-to-End Tests to run locally
 ==========================
 Tests the full A→B→C chain with both services running locally.
 
