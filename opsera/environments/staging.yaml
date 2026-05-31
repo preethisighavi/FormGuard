@@ -1,0 +1,24 @@
+name: staging
+description: Staging — real Insforge, NEAR testnet relay, real Gemini. Mock flags OFF.
+
+variables:
+  # Computer B
+  INSFORGE_API_URL: "https://api.insforge.dev"
+  INSFORGE_API_KEY: "{{secrets.INSFORGE_API_KEY}}"
+  NEAR_ENDPOINT: "{{secrets.NEAR_ENDPOINT_STAGING}}"     # Computer C staging IP:5001/near
+
+  # Computer A
+  VITE_BACKEND_URL: "{{secrets.VITE_BACKEND_URL_STAGING}}"
+  VITE_GEMINI_API_KEY: "{{secrets.VITE_GEMINI_API_KEY}}"
+  VITE_USE_MOCK: "false"                                  # mock Gemini NOT allowed
+
+  # Computer C
+  NEAR_ACCOUNT_ID: "{{secrets.NEAR_ACCOUNT_ID}}"
+  NEAR_PRIVATE_KEY: "{{secrets.NEAR_PRIVATE_KEY}}"
+  NEAR_CONTRACT_ID: "{{secrets.NEAR_CONTRACT_ID}}"
+  NEAR_NETWORK: "testnet"
+
+policy_overrides:
+  mock_gate: warn        # warn in staging (fail in prod)
+  shape_drift: fail
+  data_persistence: fail

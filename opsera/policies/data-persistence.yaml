@@ -1,0 +1,31 @@
+name: data-persistence
+description: >
+  Verifies that data written to Computer B survives a process restart.
+  If INSFORGE_API_KEY is set, data must persist (Insforge is durable).
+  If not set, data loss is expected and this policy skips.
+  Catches accidental in-memory-only deploys in staging/prod.
+
+applies_to:
+  pipelines: [formguard-deploy-staging, formguard-deploy-production]
+  condition: env.INSFORGE_API_KEY != ""
+
+steps:
+  - Write a session and one rep via POST /session/create + POST /tool/log_rep
+  - Record the session_id
+  - Restart Computer B (simulate pod rotation / rolling deploy)
+  - Wait 5 seconds for B to come back up
+  - GET /tool/session/{session_id}
+  - Assert reps array is non-empty and contains the written rep
+
+severity:
+  staging: fail
+  production: fail
+
+on_fail:
+  action: block_deploy
+  message: >
+    Data persistence check FAILED in {{environment}}.
+    A rep written before the restart was not found after restart.
+    Likely cause: INSFORGE_API_KEY is wrong or Insforge is unreachable —
+    B fell back to in-memory storage and lost data on restart.
+    Fix: verify INSFORGE_API_KEY in Opsera secrets, confirm Insforge API is reachable.

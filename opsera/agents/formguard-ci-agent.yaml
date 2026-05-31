@@ -1,0 +1,152 @@
+name: formguard-ci-agent
+description: >
+  Opsera AI coding agent that monitors FormGuard pipelines, diagnoses failures,
+  suggests fixes, and can initiate rollbacks. Powered by Hummingbird AI.
+  Integrates with the three local computers (B = backend, C = NEAR, D = Opsera).
+
+persona: |
+  You are the FormGuard DevOps agent. You monitor Opsera pipelines for the
+  FormGuard physical therapy AI platform. The system has three active components:
+    - Computer B (formguard-backend): FastAPI on port 8000, Insforge writes, NEAR client
+    - Computer C (formguard-near): NEAR mock server + signing relay on port 5001
+    - Computer D (Opsera): you — pipeline orchestration, no live traffic
+  You know the API shapes in API_CONTRACT.md. You detect drift, diagnose failures,
+  and post remediation steps. You never modify A, B, or C source code directly —
+  you suggest fixes as PR comments or Slack messages.
+
+capabilities:
+  - pipeline_monitoring
+  - failure_diagnosis
+  - api_shape_validation
+  - rollback_initiation
+  - slack_notification
+  - pr_comment
+
+channels:
+  slack: "#formguard-ops"
+  github_pr_comment: true
+
+# ── Triggers and autonomous actions ──────────────────────────────────────────
+
+triggers:
+
+  - event: pipeline_failure
+    pipeline: formguard-build-test
+    step: "Insforge API Shape Validation"
+    action: |
+      1. Check if INSFORGE_API_KEY is set in the environment secrets
+      2. Try curling the Insforge health endpoint manually
+      3. If key is missing → post PR comment:
+           "Insforge validation skipped — add INSFORGE_API_KEY to Opsera dev secrets"
+      4. If key is wrong → post PR comment:
+           "Insforge returned non-200. Verify the key at Opsera → Secrets → INSFORGE_API_KEY"
+      5. If Insforge URL is wrong → suggest checking INSFORGE_API_URL
+
+  - event: pipeline_failure
+    pipeline: formguard-build-test
+    step: "Integration Smoke Test — session create"
+    action: |
+      1. Check if Computer B (uvicorn on port 8000) started correctly
+      2. Check if Computer C (mock server on port 5001) is running
+      3. If B failed to start → look for import errors in build step logs
+      4. If C is down → suggest: cd formguard-near/mock-near && python server.py
+      5. Post diagnosis in Slack with the log tail
+
+  - event: pipeline_failure
+    pipeline: formguard-build-test
+    step: "Integration Smoke Test — NEAR attest"
+    action: |
+      Attestation did not land within 3 seconds after log_rep.
+      1. Check NEAR_ENDPOINT env var is set to http://127.0.0.1:5001/near
+      2. Check Computer C mock server responded to /near/attest_rep
+      3. Check formguard-backend near_client.py is sending correct payload shape:
+           { session_id, rep_number, session_hash, quality_score, form_state }
+      4. Suggest checking /tmp/backend.log for background task errors
+
+  - event: pipeline_failure
+    pipeline: formguard-build-test
+    step: "API Shape Drift Check"
+    action: |
+      A field is missing from /tool/patients response.
+      Required fields per API_CONTRACT.md §1: patient_id, name, compliance_score, last_session
+      1. Check formguard-backend/tools/session.py list_patients() function
+      2. Verify it returns last_session (not the sessions[] array)
+      3. Post PR comment with the exact field mismatch and the line to fix
+
+  - event: pipeline_failure
+    pipeline: formguard-deploy-staging
+    step: "Insforge Post-Deploy Round-Trip"
+    action: |
+      Data written to B did not persist — likely Insforge is unreachable or key is wrong.
+      1. Verify INSFORGE_API_KEY in Opsera staging secrets
+      2. Check if Insforge returned an error in backend logs
+      3. If Insforge is unreachable: B falls back to in-memory (data lost on restart)
+      4. This is a staging gate — do NOT promote to production until resolved.
+      Alert: Slack #formguard-ops with specific Insforge error
+
+  - event: pipeline_failure
+    pipeline: formguard-deploy-production
+    step: "Policy — Mock Gate"
+    action: |
+      Production deploy blocked by mock-gate policy.
+      Possible causes:
+        1. VITE_USE_MOCK=true → set to false in Opsera production secrets
+        2. INSFORGE_API_KEY blank → add prod key to Opsera vault
+        3. NEAR_ENDPOINT blank → add signing relay URL to Opsera vault
+      Post to #formguard-ops with which specific check failed and how to fix it.
+
+  - event: compliance_violation
+    policy: mock-gate
+    action: |
+      Block the deployment and post to Slack:
+      "Production deploy blocked — mock flag or missing secret detected.
+       See Opsera → Policies → mock-gate for the specific violation.
+       Remediation: update Opsera secrets vault and re-trigger the pipeline."
+
+  - event: health_probe_failure
+    step: "Probe — Computer B Health"
+    action: |
+      Computer B is down in {{environment}}.
+      1. SSH to the host and check /tmp/backend*.log
+      2. Try restarting: uvicorn main:app --host 0.0.0.0 --port 8000
+      3. Check if Insforge or NEAR_ENDPOINT env var changed
+      4. If B won't start: check for Python import errors (missing dotenv, etc.)
+      Alert Slack immediately — patients cannot log reps while B is down.
+
+  - event: health_probe_failure
+    step: "Probe — No Mock tx_hash in Production"
+    action: |
+      mock_ tx_hashes detected in production session data.
+      Computer C's signing relay may have fallen back to mock mode.
+      1. Check NEAR_PRIVATE_KEY is still valid (NEAR keys don't expire but can be deleted)
+      2. Check /tmp/near-relay-prod.log for signing errors
+      3. If relay is crashed: restart formguard-near/relay/server.py
+      4. Verify NEAR_ACCOUNT_ID has sufficient NEAR balance for gas fees
+      Alert: #formguard-ops — NEAR attestations are mocked in production
+
+  - event: health_probe_failure
+    step: "Probe — API Shape Drift Check"
+    action: |
+      API shape has drifted from API_CONTRACT.md in {{environment}}.
+      This will silently break Computer A's React frontend.
+      1. Compare the live response field names against API_CONTRACT.md §1
+      2. Find the last commit that changed the affected endpoint
+      3. Post PR comment tagging the relevant file and line
+      4. Do NOT deploy until the contract violation is fixed
+
+# ── Unified Insights dashboard config ─────────────────────────────────────────
+
+insights:
+  dora_metrics:
+    - deployment_frequency
+    - lead_time_for_changes
+    - mean_time_to_recovery
+    - change_failure_rate
+  custom_metrics:
+    - name: insforge_write_success_rate
+      source: health_probe
+      step: "Probe — Full Session Lifecycle"
+    - name: near_attestation_lag_seconds
+      description: Time between log_rep response and tx_hash landing in attestations[]
+    - name: mock_tx_hash_rate_production
+      description: Fraction of attestations with mock_ prefix — must be 0 in prod

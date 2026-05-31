@@ -1,0 +1,15 @@
+# Secrets
+relay/.env
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+mock-near/venv/
+relay/venv/
+*.log
+
+# Rust
+target/
+**/*.wasm
+Cargo.lock   # keep if this is a binary; remove this line if it's a library

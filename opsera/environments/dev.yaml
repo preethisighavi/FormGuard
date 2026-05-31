@@ -1,0 +1,24 @@
+name: dev
+description: Local development — all three computers run on localhost. Mock NEAR. Dev Insforge key.
+
+variables:
+  # Computer B
+  INSFORGE_API_URL: "https://api.insforge.dev"
+  INSFORGE_API_KEY: "{{secrets.INSFORGE_API_KEY}}"       # dev key — supply in Opsera vault
+  NEAR_ENDPOINT: "{{secrets.NEAR_ENDPOINT_DEV}}"         # http://127.0.0.1:5001/near
+
+  # Computer A
+  VITE_BACKEND_URL: "{{secrets.VITE_BACKEND_URL_DEV}}"   # http://localhost:8000
+  VITE_GEMINI_API_KEY: "{{secrets.VITE_GEMINI_API_KEY}}"
+  VITE_USE_MOCK: "true"                                   # mock Gemini allowed in dev
+
+  # Computer C
+  NEAR_ACCOUNT_ID: "{{secrets.NEAR_ACCOUNT_ID}}"
+  NEAR_PRIVATE_KEY: "{{secrets.NEAR_PRIVATE_KEY}}"
+  NEAR_CONTRACT_ID: "{{secrets.NEAR_CONTRACT_ID}}"
+  NEAR_NETWORK: "testnet"
+
+policy_overrides:
+  mock_gate: disabled    # mock flag allowed in dev
+  shape_drift: warn      # warn only, don't block in dev
+  data_persistence: disabled

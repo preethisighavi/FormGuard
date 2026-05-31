@@ -1,0 +1,30 @@
+name: Insforge
+type: REST_API
+description: >
+  Insforge data layer — used by Computer B (formguard-backend) to persist
+  sessions, reps, flags, and patient records. Registered here so pipeline
+  steps can reference it by name and Opsera can surface its health in
+  Unified Insights.
+
+connection:
+  base_url: "{{secrets.INSFORGE_API_URL}}"        # https://api.insforge.dev
+  auth:
+    type: api_key
+    header: x-api-key
+    value: "{{secrets.INSFORGE_API_KEY}}"
+  health_check:
+    method: GET
+    path: /collections
+    expect_status: 200
+
+categories:
+  - storage
+  - data_layer
+
+# Opsera surfaces this in the Unified Insights health dashboard
+insights:
+  label: Insforge Data Layer
+  metrics:
+    - response_time_ms
+    - error_rate
+    - availability_pct

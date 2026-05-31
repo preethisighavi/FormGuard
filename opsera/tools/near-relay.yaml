@@ -1,0 +1,25 @@
+name: NEAR-Relay
+type: REST_API
+description: >
+  Computer C NEAR signing relay (or mock server in dev). Computer B posts
+  attestation requests here. Registered so the health probe and deploy
+  pipeline can validate it independently of B.
+
+connection:
+  base_url: "{{secrets.NEAR_ENDPOINT}}"           # set per environment
+  auth:
+    type: none                                     # C's relay has no auth — sits on private network
+  health_check:
+    method: GET
+    path: /health
+    expect_status: 200
+
+categories:
+  - blockchain
+  - attestation
+
+insights:
+  label: NEAR Attestation Relay
+  metrics:
+    - response_time_ms
+    - error_rate

@@ -1,0 +1,133 @@
+name: formguard-health-probe
+description: >
+  Scheduled probe — runs every 15 minutes against staging and production.
+  Validates B, C, Insforge reachability, API shape, and that no mock tx_hashes
+  appear in live environments. Alerts Slack on any failure.
+
+triggers:
+  - event: schedule
+    cron: "*/15 * * * *"
+    environments: [staging, production]
+
+steps:
+
+  - name: "Probe — Computer B Health"
+    tool: Custom Script
+    commands:
+      - |
+        RESP=$(curl -sf --max-time 5 $VITE_BACKEND_URL/health)
+        echo $RESP | python3 -c "import sys,json; d=json.load(sys.stdin); assert d.get('status')=='ok'" \
+          || (echo "ALERT: Computer B /health failed" && exit 1)
+        echo "B OK"
+    env_inject: [VITE_BACKEND_URL]
+
+  - name: "Probe — Computer C Health"
+    tool: Custom Script
+    commands:
+      - |
+        C_HEALTH=$(echo "$NEAR_ENDPOINT" | sed 's|/near||')/health
+        RESP=$(curl -sf --max-time 5 $C_HEALTH)
+        echo $RESP | python3 -c "import sys,json; d=json.load(sys.stdin); assert d.get('status')=='ok'" \
+          || (echo "ALERT: Computer C /health failed" && exit 1)
+        echo "C OK"
+    env_inject: [NEAR_ENDPOINT]
+
+  - name: "Probe — Insforge Reachability"
+    tool: Custom Script
+    commands:
+      - |
+        if [ -z "$INSFORGE_API_KEY" ]; then
+          echo "SKIP: no key (expected in dev)"
+          exit 0
+        fi
+        curl -sf --max-time 5 "$INSFORGE_API_URL/collections" \
+          -H "x-api-key: $INSFORGE_API_KEY" \
+          || (echo "ALERT: Insforge unreachable" && exit 1)
+        echo "Insforge OK"
+    env_inject: [INSFORGE_API_URL, INSFORGE_API_KEY]
+
+  - name: "Probe — Full Session Lifecycle"
+    tool: Custom Script
+    commands:
+      - |
+        SESSION=$(curl -sf --max-time 5 -X POST $VITE_BACKEND_URL/session/create \
+          -H 'Content-Type: application/json' \
+          -d '{"patient_name":"opsera-probe","program":"knee_rehab","exercise":"squat"}')
+        SESSION_ID=$(echo $SESSION | python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
+
+        curl -sf --max-time 5 -X POST $VITE_BACKEND_URL/tool/log_rep \
+          -H 'Content-Type: application/json' \
+          -d "{\"session_id\":\"$SESSION_ID\",\"rep_number\":1,\"form_state\":\"GREEN\",\"quality_score\":90,\"coaching_cue\":\"probe\",\"pain_level\":0}"
+
+        sleep 4
+        DATA=$(curl -sf --max-time 5 $VITE_BACKEND_URL/tool/session/$SESSION_ID)
+        echo $DATA | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['reps'], 'No reps'"
+        echo "Lifecycle probe OK for session $SESSION_ID"
+    env_inject: [VITE_BACKEND_URL]
+
+  - name: "Probe — No Mock tx_hash in Production"
+    tool: Custom Script
+    environment_filter: [production]   # only runs in production
+    commands:
+      - |
+        DATA=$(curl -sf --max-time 5 $VITE_BACKEND_URL/tool/session/demo_session_1 2>/dev/null || echo '{}')
+        echo $DATA | python3 -c "
+        import sys, json
+        d = json.load(sys.stdin)
+        for a in d.get('attestations', []):
+            if a.get('tx_hash','').startswith('mock_'):
+                print(f'ALERT: mock tx_hash found in production: {a[\"tx_hash\"]}')
+                sys.exit(1)
+        print('No mock tx_hashes in production')
+        "
+    env_inject: [VITE_BACKEND_URL]
+
+  - name: "Probe — API Shape Drift Check"
+    tool: Custom Script
+    commands:
+      - |
+        python3 - <<'EOF'
+        import urllib.request, json, sys, os
+
+        base = os.environ.get("VITE_BACKEND_URL", "http://localhost:8000")
+
+        checks = {
+            f"{base}/tool/patients": {
+                "root_keys": ["patients"],
+                "item_keys": ["patient_id", "name", "compliance_score", "last_session"],
+                "item_source": lambda d: d.get("patients", []),
+            },
+        }
+
+        failed = []
+        for url, spec in checks.items():
+            try:
+                with urllib.request.urlopen(url, timeout=5) as r:
+                    data = json.loads(r.read())
+                for k in spec["root_keys"]:
+                    if k not in data:
+                        failed.append(f"{url}: missing root key '{k}'")
+                for item in spec["item_source"](data)[:1]:
+                    for k in spec["item_keys"]:
+                        if k not in item:
+                            failed.append(f"{url}: item missing field '{k}'")
+            except Exception as e:
+                failed.append(f"{url}: unreachable — {e}")
+
+        if failed:
+            print("API SHAPE DRIFT DETECTED:")
+            for f in failed:
+                print("  •", f)
+            sys.exit(1)
+
+        print("Shape drift check passed")
+        EOF
+    env_inject: [VITE_BACKEND_URL]
+
+notifications:
+  on_failure:
+    slack: "{{secrets.SLACK_WEBHOOK_URL}}"
+    message: >
+      HEALTH PROBE FAILED [{{environment}}] — {{step_name}}.
+      FormGuard may be degraded. Check logs immediately.
+      Hummingbird AI analysis: {{hummingbird_suggestion}}

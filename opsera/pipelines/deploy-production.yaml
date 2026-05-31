@@ -1,0 +1,178 @@
+name: formguard-deploy-production
+description: >
+  Production deploy triggered by a release tag (e.g. v1.0.0).
+  Requires explicit approval before any step runs.
+  Mock flags must be OFF. Real Insforge + NEAR required. Auto-rollback on health failure.
+
+triggers:
+  - event: tag_push
+    pattern: "v[0-9]+\\.[0-9]+\\.[0-9]+"   # matches v1.0.0, v2.3.1, etc.
+
+environment: production
+
+depends_on_pipeline: formguard-build-test
+
+# ── Approval gate — nothing deploys until approved ───────────────────────────
+approval_gate:
+  required: true
+  approvers:
+    - "{{secrets.GITHUB_ORG}}/formguard-leads"
+  timeout_minutes: 60
+  notify:
+    slack: "{{secrets.SLACK_WEBHOOK_URL}}"
+    message: >
+      Production deploy ready for {{tag}}. Approve in Opsera UI:
+      https://app.opsera.io/pipelines/formguard-deploy-production
+
+steps:
+
+  # ── Policy checks run first, before any real deploy ──────────────────────
+
+  - name: "Policy — Mock Gate"
+    tool: Custom Script
+    description: Hard-fail if any mock flag is on.
+    commands:
+      - |
+        if [ "$VITE_USE_MOCK" = "true" ]; then
+          echo "POLICY VIOLATION: VITE_USE_MOCK=true in production. Deploy blocked."
+          exit 1
+        fi
+        if [ -z "$INSFORGE_API_KEY" ]; then
+          echo "POLICY VIOLATION: INSFORGE_API_KEY not set in production. Deploy blocked."
+          exit 1
+        fi
+        if [ -z "$NEAR_ENDPOINT" ]; then
+          echo "POLICY VIOLATION: NEAR_ENDPOINT not set in production. Deploy blocked."
+          exit 1
+        fi
+        echo "Policy checks passed"
+    env_inject:
+      - VITE_USE_MOCK
+      - INSFORGE_API_KEY
+      - NEAR_ENDPOINT
+
+  # ── Deploy C ──────────────────────────────────────────────────────────────
+
+  - name: "Deploy Computer C — NEAR Signing Relay"
+    depends_on: "Policy — Mock Gate"
+    tool: Custom Script
+    commands:
+      - pkill -f "relay/server.py" || true
+      - cd formguard-near/relay
+      - pip install flask near-api-py -q
+      - nohup python3 server.py > /tmp/near-relay-prod.log 2>&1 &
+      - sleep 4
+      - curl -sf "$NEAR_ENDPOINT/../health" || (echo "FAIL: NEAR relay not healthy in prod" && exit 1)
+    env_inject:
+      - NEAR_ACCOUNT_ID
+      - NEAR_PRIVATE_KEY
+      - NEAR_CONTRACT_ID
+      - NEAR_NETWORK
+
+  # ── Deploy B ──────────────────────────────────────────────────────────────
+
+  - name: "Deploy Computer B — FastAPI Backend"
+    depends_on: "Deploy Computer C — NEAR Signing Relay"
+    tool: Python
+    version: "3.11"
+    working_dir: formguard-backend
+    commands:
+      - pkill -f "uvicorn main:app" || true
+      - ./venv/bin/pip install -r requirements.txt -q
+      - nohup ./venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2 > /tmp/backend-prod.log 2>&1 &
+      - sleep 4
+      - curl -sf http://localhost:8000/health || (echo "FAIL: Backend not healthy in prod" && exit 1)
+    env_inject:
+      - INSFORGE_API_URL
+      - INSFORGE_API_KEY
+      - NEAR_ENDPOINT
+
+  # ── Data persistence check (write → restart → read) ──────────────────────
+
+  - name: "Policy — Data Persistence Check"
+    depends_on: "Deploy Computer B — FastAPI Backend"
+    tool: Custom Script
+    commands:
+      - |
+        SESSION=$(curl -sf -X POST http://localhost:8000/session/create \
+          -H 'Content-Type: application/json' \
+          -d '{"patient_name":"Opsera-ProdCheck","program":"knee_rehab","exercise":"squat"}')
+        SESSION_ID=$(echo $SESSION | python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
+        curl -sf -X POST http://localhost:8000/tool/log_rep \
+          -H 'Content-Type: application/json' \
+          -d "{\"session_id\":\"$SESSION_ID\",\"rep_number\":1,\"form_state\":\"GREEN\",\"quality_score\":95,\"coaching_cue\":\"prod check\",\"pain_level\":0}"
+        echo "Data written. Restarting Backend..."
+        pkill -f "uvicorn main:app"
+        sleep 2
+        nohup ./venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2 > /tmp/backend-prod.log 2>&1 &
+        sleep 4
+        DATA=$(curl -sf http://localhost:8000/tool/session/$SESSION_ID)
+        echo $DATA | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['reps'], 'FAIL: data lost after restart (INSFORGE_API_KEY may be wrong)'"
+        echo "Data persistence check OK"
+
+  # ── Deploy A ──────────────────────────────────────────────────────────────
+
+  - name: "Deploy Computer A — React Frontend"
+    depends_on: "Policy — Data Persistence Check"
+    tool: Node.js
+    version: "20"
+    working_dir: formguard-frontend
+    commands:
+      - npm ci
+      - npm run build
+      # Replace the two lines below with your actual static host deploy command:
+      # e.g.  aws s3 sync dist/ s3://formguard-prod-frontend --delete
+      # e.g.  npx wrangler pages deploy dist --project-name formguard
+      - echo "TODO: swap npm run preview for your static host deploy command"
+      - nohup npm run preview -- --port 5173 --host > /tmp/frontend-prod.log 2>&1 &
+      - sleep 3
+      - curl -sf http://localhost:5173 || (echo "FAIL: Frontend not responding" && exit 1)
+    env_inject:
+      - VITE_BACKEND_URL
+      - VITE_GEMINI_API_KEY
+      - VITE_USE_MOCK
+
+  # ── 15-min watch window + auto-rollback ──────────────────────────────────
+
+  - name: "Post-Deploy Health Watch (15 min)"
+    depends_on: "Deploy Computer A — React Frontend"
+    tool: Custom Script
+    timeout_minutes: 20
+    on_failure: rollback
+    commands:
+      - |
+        END=$(($(date +%s) + 900))
+        while [ $(date +%s) -lt $END ]; do
+          B=$(curl -sf http://localhost:8000/health | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('status')=='ok' else 1)" 2>/dev/null)
+          C=$(curl -sf "$NEAR_ENDPOINT/../health" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('status')=='ok' else 1)" 2>/dev/null)
+          if [ $? -ne 0 ]; then
+            echo "Health check failed during watch window — triggering rollback"
+            exit 1
+          fi
+          echo "$(date): B OK, C OK"
+          sleep 60
+        done
+        echo "15-min watch window passed. Production is stable."
+
+rollback:
+  steps:
+    - name: "Rollback — restart from previous stable image"
+      tool: Custom Script
+      commands:
+        - echo "Auto-rollback triggered. Restarting from last stable."
+        - pkill -f "uvicorn main:app" || true
+        - git stash && git checkout HEAD~1
+        - cd formguard-backend && nohup ./venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 > /tmp/backend-rollback.log 2>&1 &
+        - sleep 4
+        - curl -sf http://localhost:8000/health || echo "Rollback also unhealthy — manual intervention needed"
+  notify:
+    slack: "{{secrets.SLACK_WEBHOOK_URL}}"
+    message: "PROD ROLLBACK triggered for {{tag}}. Check /tmp/*.log. Manual review required."
+
+notifications:
+  on_success:
+    slack: "{{secrets.SLACK_WEBHOOK_URL}}"
+    message: "Production {{tag}} deployed successfully. All health checks passed."
+  on_failure:
+    slack: "{{secrets.SLACK_WEBHOOK_URL}}"
+    message: "Production {{tag}} deploy FAILED at {{step_name}}. Rollback initiated."

@@ -1,0 +1,4 @@
+# The placeholder is safe to commit (no real values).
+# Never commit a filled-in copy.
+.env
+.env.filled

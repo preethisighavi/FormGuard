@@ -1,0 +1,42 @@
+name: mock-gate
+description: >
+  Blocks any production (or staging-warn) deploy where mock flags are active
+  or required secrets are absent. This is a non-negotiable policy.
+
+applies_to:
+  pipelines: [formguard-deploy-staging, formguard-deploy-production]
+  environments: [staging, production]
+
+rules:
+  - id: no_mock_gemini_in_prod
+    check: env.VITE_USE_MOCK != "true"
+    severity: fail         # hard block in prod, warn in staging (see environment overrides)
+    message: >
+      VITE_USE_MOCK=true detected in {{environment}}.
+      Production must stream real Gemini Live — mock mode is for development only.
+      Fix: set VITE_USE_MOCK=false in Opsera secrets for {{environment}}.
+
+  - id: insforge_key_required_in_prod
+    check: env.INSFORGE_API_KEY != ""
+    severity: fail
+    message: >
+      INSFORGE_API_KEY is blank in {{environment}}.
+      Data will not persist (in-memory fallback only).
+      Fix: add INSFORGE_API_KEY to Opsera secrets vault for {{environment}}.
+
+  - id: near_endpoint_required_in_prod
+    check: env.NEAR_ENDPOINT != ""
+    severity: fail
+    message: >
+      NEAR_ENDPOINT is blank in {{environment}}.
+      Attestations will generate mock tx_hashes — not acceptable in production.
+      Fix: set NEAR_ENDPOINT to the real signing relay URL in Opsera secrets.
+
+  - id: no_mock_tx_hash_in_prod
+    check: "!response.attestations[*].tx_hash.startsWith('mock_')"
+    source: GET {{env.VITE_BACKEND_URL}}/tool/session/demo_session_1
+    severity: warn
+    message: >
+      mock_ tx_hashes found in live session data.
+      Computer C may still be running the mock server instead of the real relay.
+      Expected: real NEAR base58 tx_hash. Got: mock_ prefix.

@@ -1,0 +1,30 @@
+name: production
+description: Production — real everything. Mock flags strictly OFF. Approval gate required.
+
+variables:
+  # Computer B
+  INSFORGE_API_URL: "https://api.insforge.dev"
+  INSFORGE_API_KEY: "{{secrets.INSFORGE_API_KEY}}"
+  NEAR_ENDPOINT: "{{secrets.NEAR_ENDPOINT_PROD}}"        # https://near-relay.formguard.io/near
+
+  # Computer A
+  VITE_BACKEND_URL: "{{secrets.VITE_BACKEND_URL_PROD}}"
+  VITE_GEMINI_API_KEY: "{{secrets.VITE_GEMINI_API_KEY}}"
+  VITE_USE_MOCK: "false"                                  # MUST be false — mock-gate policy enforces
+
+  # Computer C
+  NEAR_ACCOUNT_ID: "{{secrets.NEAR_ACCOUNT_ID}}"
+  NEAR_PRIVATE_KEY: "{{secrets.NEAR_PRIVATE_KEY}}"
+  NEAR_CONTRACT_ID: "{{secrets.NEAR_CONTRACT_ID}}"
+  NEAR_NETWORK: "testnet"                                 # change to mainnet when ready
+
+policy_overrides:
+  mock_gate: fail        # hard block — no exceptions
+  shape_drift: fail
+  data_persistence: fail
+
+approval_gate:
+  required: true
+  approvers:
+    - "{{secrets.GITHUB_ORG}}/formguard-leads"           # GitHub team — fill in org
+  notify_channel: "{{secrets.SLACK_WEBHOOK_URL}}"

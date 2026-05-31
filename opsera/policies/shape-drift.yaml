@@ -1,0 +1,105 @@
+name: shape-drift
+description: >
+  Compares live API responses against API_CONTRACT.md §1–§3 after every deploy.
+  Fails the pipeline if any required field is missing or the wrong type.
+  This catches breaking changes before the frontend (Computer A) discovers them.
+
+applies_to:
+  pipelines: [formguard-deploy-staging, formguard-deploy-production, formguard-health-probe]
+
+# Each endpoint below is checked after B is deployed.
+# Fields listed are REQUIRED (from API_CONTRACT.md §1).
+
+endpoints:
+
+  - path: /session/create
+    method: POST
+    body: '{"patient_name":"shape-drift-check","program":"knee_rehab","exercise":"squat"}'
+    required_fields:
+      - session_id: string
+      - patient_id: string
+      - exercise: string
+      - prescribed_reps: integer
+
+  - path: /tool/log_rep
+    method: POST
+    body_template: >
+      {"session_id":"{{session_id}}","rep_number":1,"form_state":"GREEN",
+       "quality_score":90,"coaching_cue":"drift-check","pain_level":0}
+    required_fields:
+      - ok: boolean
+      - recorded: boolean
+
+  - path: /tool/flag_for_pt
+    method: POST
+    body_template: >
+      {"session_id":"{{session_id}}","type":"pain_spike","rep_number":1,"pain_level":7,"notes":"drift"}
+    required_fields:
+      - ok: boolean
+      - flag_id: string
+
+  - path: /tool/session/{session_id}
+    method: GET
+    required_fields:
+      session:
+        - session_id: string
+        - patient_id: string
+        - exercise: string
+        - prescribed_reps: integer
+        - status: string                 # IN_PROGRESS | COMPLETE
+      reps[]:
+        - rep_number: integer
+        - form_state: string             # GREEN | YELLOW | RED
+        - quality_score: number
+        - coaching_cue: string
+        - pain_level: integer
+        - timestamp: integer             # unix seconds
+      flags[]:
+        - flag_id: string
+        - type: string
+        - timestamp: integer
+      attestations[]:
+        - session_id: string
+        - rep_number: integer
+        - session_hash: string
+        - quality_score: number
+        - form_state: string
+        - tx_hash: string
+        - block_height: integer
+        - status: string
+        - timestamp: integer
+
+  - path: /tool/patients
+    method: GET
+    required_fields:
+      patients[]:
+        - patient_id: string
+        - name: string
+        - compliance_score: integer
+        - last_session: string
+
+  - path: /tool/patient/{patient_id}/history
+    method: GET
+    required_fields:
+      sessions[]:
+        - session_id: string
+        - exercise: string
+        - status: string
+        - compliance_score: integer
+        - timestamp: integer
+      compliance_score: integer
+      trend: string                      # improving | stable | declining
+
+severity:
+  staging: fail
+  production: fail
+
+on_drift:
+  action: block_deploy
+  notify:
+    slack: "{{secrets.SLACK_WEBHOOK_URL}}"
+    message: >
+      API SHAPE DRIFT DETECTED in {{environment}}.
+      Endpoint {{endpoint}} is missing field(s): {{missing_fields}}.
+      This will break Computer A (React frontend). Deploy blocked.
+      Compare live response against API_CONTRACT.md §1.
