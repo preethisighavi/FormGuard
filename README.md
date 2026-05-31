@@ -80,7 +80,7 @@ FormGuard is built on top of — and made possible by — three platform sponsor
 **Testnet setup:**
 ```
 NEAR_ACCOUNT_ID=yourname.testnet
-NEAR_PRIVATE_KEY=ed25519:...
+NEAR_PRIVATE_KEY=xy12345:...
 NEAR_CONTRACT_ID=yourname.testnet
 NEAR_NETWORK=testnet
 ```
