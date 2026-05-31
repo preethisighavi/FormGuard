@@ -62,89 +62,26 @@
 
 ## Interface Contracts
 
-### A → B: Backend Tool API (POST /tool/{action})
+> **All request/response shapes live in [`API_CONTRACT.md`](./API_CONTRACT.md) — the single
+> source of truth.** This section states only the *principles* that shaped them. If a shape
+> here and the contract ever disagree, the contract wins.
 
-**Gemini Live only ever calls `log_rep` and `flag_for_pt`.** Attestation is NOT a Gemini
-tool — B computes the hash and fires the NEAR call itself (see below). This keeps the
-live audio loop synchronous and cheap; chain latency never blocks coaching.
+**The principles the contract encodes:**
 
-```
-POST /session/create
-{ "patient_name": "Jane Doe", "program": "knee_rehab", "exercise": "squat" }
-→ { "session_id": "abc123", "patient_id": "pat_7f3", "exercise": "squat",
-    "prescribed_reps": 10 }
-# B maps patient_name → stable patient_id (creates one if new). A stores both.
-
-POST /tool/log_rep                       # called by Gemini Live every rep
-{
-  "session_id": "abc123",
-  "rep_number": 4,
-  "form_state": "YELLOW",
-  "quality_score": 62,
-  "coaching_cue": "Push knees outward",
-  "pain_level": 2
-}
-→ { "ok": true, "recorded": true }
-# B dedups by (session_id, rep_number) — last write wins (Gemini miscounts).
-# B then fires attest_rep to C ASYNCHRONOUSLY (does not block this response).
-
-POST /tool/flag_for_pt                    # called by Gemini Live on pain/safety
-{ "session_id": "abc123", "type": "pain_spike",
-  "rep_number": 4, "pain_level": 7, "notes": "patient said knee hurts" }
-→ { "ok": true, "flag_id": "flag_xxx" }
-# Writing a flag ALSO emits an SSE event on /pt/stream → PT dashboard lights up live.
-
-# attest_rep is INTERNAL to B (not exposed to Gemini). B computes:
-#   session_hash = sha256("{session_id}:{patient_id}:{rep_number}:{quality_score}:{form_state}")
-# then POSTs to C. A never sends a hash and never calls this.
-
-GET /tool/session/{session_id}
-→ { "session": {...}, "reps": [...], "flags": [...], "attestations": [...] }
-# A polls this (or reads /pt/stream) to surface each tx_hash as it lands on-chain.
-
-GET /tool/patients
-→ { "patients": [{ "patient_id": "pat_7f3", "name": "Jane Doe",
-    "compliance_score": 88, "last_session": "..." }, ...] }
-# Powers the PT dashboard patient-list sidebar.
-
-GET /tool/patient/{patient_id}/history
-→ { "sessions": [...], "compliance_score": 88, "trend": "improving" }
-
-GET /pt/stream   (Server-Sent Events)
-→ event: flag    data: { flag_id, patient_id, session_id, type, pain_level, rep_number }
-→ event: attest  data: { session_id, rep_number, tx_hash }
-# B pushes flags + attestations here. PT dashboard subscribes → real-time escalation.
-```
-
-### B → C: NEAR Interface (changeable — Computer C controls this)
-
-```
-Computer C provides either:
-  a) Mock HTTP server at http://c.local:5001/near
-  b) Real signing relay at the same path (NOT the raw RPC — see below)
-
-Both respond with the same shape:
-
-POST /near/attest_rep
-{ "session_id": "abc123", "rep_number": 4,
-  "session_hash": "0x...", "quality_score": 62, "form_state": "YELLOW" }
-→ { "tx_hash": "9k3...", "block_height": 12345, "status": "confirmed" }
-
-POST /near/verify_session
-{ "session_id": "abc123" }
-→ { "total_reps": 10, "green_pct": 90, "compliant": true,    # compliant ⇔ green_pct >= 80
-    "attestations": [...], "tx_hashes": [...] }
-```
-
-**Real mode is a signing relay, not raw RPC.** B is forbidden the NEAR SDK, so C runs an
-HTTP endpoint that signs + submits transactions with a funded testnet key and returns the
-real `tx_hash`. Because per-rep attestation fires rapid sequential txns, **C MUST serialize
-submissions through a single in-process queue (one access key)** or hit nonce collisions.
-NEAR testnet blocks are ~1–1.5s; 10 serialized reps over a 60–90s exercise is fine.
-
-Computer C defines the NEAR schema. Computer B treats it as an HTTP API. Computer C can swap
-mock ↔ real relay without B changing a line. B calls C **asynchronously** (fire-and-forget
-from the live loop), so relay latency never stalls Gemini.
+1. **A → B → C, never A → C.** A calls B's `/tool/*`, `/session/*`, `/pt/stream`. B calls C's
+   `/near/*`. The frontend never touches NEAR.
+2. **Gemini Live gets exactly two tools: `log_rep` and `flag_for_pt`.** Attestation is internal
+   to B — B computes the 5-field hash and fires the NEAR call itself, asynchronously. A never
+   sends or sees a hash. Fewer tools = more reliable tool-calling.
+3. **The live loop returns instantly; slow work goes async.** `log_rep`/`flag_for_pt` answer in
+   one round-trip; NEAR attestation and the PT push happen off the response path.
+4. **`flag_for_pt` is the hero path:** it emits a `flag` SSE event on `/pt/stream` so the PT
+   dashboard lights up live. Attestations emit `attest` events the same way.
+5. **C is a signing relay in real mode, not raw RPC.** B is forbidden the NEAR SDK, so C signs +
+   submits with a funded testnet key, **serializing through one queue** (nonce safety). Mock and
+   real return identical shapes — swap one for the other and no other computer changes a line.
+6. **Compliance is one rule everywhere:** `compliant ⇔ green_pct >= 80`. Hash is one formula:
+   `SHA256("{session_id}:{patient_id}:{rep_number}:{quality_score}:{form_state}")`.
 
 ---
 

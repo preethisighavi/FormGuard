@@ -6,6 +6,11 @@
 
 **Tech:** FastAPI, Python 3.11+, httpx (for HTTP calls to C and Insforge).
 
+> **All request/response shapes are normative in [`API_CONTRACT.md`](./API_CONTRACT.md)** — §1
+> (what you return to A), §2 (what you send C), §3 (the Attestation object), §4 (hash formula),
+> §0 (enums, ranges, the 400-vs-fallback error rule). This plan describes *implementation*; the
+> contract defines the *shapes*. When they differ, the contract wins.
+
 ---
 
 ## Quick Start
@@ -44,19 +49,20 @@ models.py            # Pydantic models for all endpoints
 
 ### Endpoints
 
-```
-POST /session/create  → { session_id, patient_id, exercise, prescribed_reps }
-                        # body: { patient_name, program, exercise } — map name→patient_id
-POST /tool/log_rep    → { ok, recorded }    # also fires attest_rep async + emits SSE
-POST /tool/flag_for_pt→ { ok, flag_id }      # also emits SSE flag event
-GET  /tool/session/{session_id} → { session, reps[], flags[], attestations[] }
-GET  /tool/patients   → { patients[] }       # list for PT dashboard sidebar
-GET  /tool/patient/{patient_id}/history → { sessions[], compliance_score, trend }
-GET  /pt/stream       → text/event-stream    # SSE: `flag` + `attest` events, live
+You own these. **Exact shapes: [`API_CONTRACT.md`](./API_CONTRACT.md) §1.** Summary:
 
-# attest_rep is INTERNAL — fired by log_rep, not called by A/Gemini. Keep it as a
-# function (optionally a debug POST /tool/attest_rep), but the live path auto-attests.
-```
+| Endpoint | Notes |
+|----------|-------|
+| `POST /session/create` | body `{patient_name, program, exercise}`; map name → stable `patient_id` |
+| `POST /tool/log_rep` | returns instantly; fires async attest + emits `attest` SSE |
+| `POST /tool/flag_for_pt` | emits `flag` SSE event (hero path) |
+| `GET /tool/session/{id}` | aggregates reps + flags + attestations |
+| `GET /tool/patients` | PT dashboard sidebar list |
+| `GET /tool/patient/{id}/history` | sessions + compliance_score + trend |
+| `GET /pt/stream` | SSE `flag` + `attest` events |
+
+`attest_rep` is **internal** — fired by `log_rep`, never called by A/Gemini. Keep it a function
+(optionally a debug `POST /tool/attest_rep`); the live path auto-attests.
 
 ### Tool Implementations
 

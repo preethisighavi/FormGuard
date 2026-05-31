@@ -6,6 +6,11 @@
 
 **Tech:** React + TypeScript + Vite. No backend framework needed.
 
+> **All request/response shapes are normative in [`API_CONTRACT.md`](./API_CONTRACT.md).**
+> This plan describes *what each screen does*; the contract defines the exact JSON (§1 = the
+> endpoints you call, §3 = the Attestation object). When they differ, the contract wins. Don't
+> hardcode shapes from memory.
+
 ---
 
 ## Quick Start

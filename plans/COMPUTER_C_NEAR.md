@@ -6,6 +6,13 @@
 
 **Tech:** Rust (NEAR SDK) for the smart contract. Python/Flask or Node/Express for the mock server (pick whatever you're fastest in).
 
+> **The HTTP shapes B calls (`/near/attest_rep`, `/near/verify_session`) are normative in
+> [`API_CONTRACT.md`](./API_CONTRACT.md) §2–§4.** Your mock AND your real signing relay must
+> match them exactly — `tx_hash`/`block_height`/`status`, the `Attestation` object (§3), the
+> 5-field hash (§4), and `compliant ⇔ green_pct >= 80`. The Rust structs below are *internal*;
+> what matters to B is the JSON serialization matching the contract. When they differ, the
+> contract wins.
+
 ---
 
 ## Quick Start
