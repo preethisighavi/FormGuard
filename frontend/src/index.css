@@ -1,0 +1,103 @@
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --muted: #8b949e;
+  --green: #3fb950;
+  --green-bg: #132a1a;
+  --amber: #e3b341;
+  --amber-bg: #2a1f0a;
+  --red: #ff6b6b;
+  --red-bg: #2a0a0a;
+  --blue: #58a6ff;
+  --purple: #bc8cff;
+
+  color-scheme: dark;
+  font-family: "Satoshi", ui-sans-serif, system-ui, sans-serif;
+  font-feature-settings: "tnum" 1;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+}
+
+/* --- Keyframes for the Vital Ring (separate elements so transforms never collide) --- */
+
+/* Rep pulse: quick scale + glow, retriggered per rep by remounting via key. */
+@keyframes repPulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.9;
+  }
+  35% {
+    transform: scale(1.06);
+    opacity: 0.35;
+  }
+  100% {
+    transform: scale(1.1);
+    opacity: 0;
+  }
+}
+
+/* Idle breathe: slow, calm; paused on RED. */
+@keyframes breathe {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.45;
+  }
+  50% {
+    transform: scale(1.02);
+    opacity: 0.75;
+  }
+}
+
+/* Caption drops in from just under the video. */
+@keyframes captionDrop {
+  from {
+    transform: translateY(-12px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+/* STOP takeover flood. */
+@keyframes redFlood {
+  from {
+    opacity: 0;
+    transform: scale(1.04);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Live status dot. */
+@keyframes blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
