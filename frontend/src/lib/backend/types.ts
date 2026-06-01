@@ -2,7 +2,7 @@
 // If a shape here ever disagrees with the contract, the contract wins.
 
 export type FormState = "GREEN" | "YELLOW" | "RED";
-export type Program = "knee_rehab" | "hip_rehab" | "back_rehab";
+export type Program = "knee_rehab" | "hip_rehab" | "back_rehab" | "wrist_rsi";
 export type FlagType = "pain_spike" | "form_breakdown" | "patient_request";
 export type Trend = "improving" | "stable" | "declining";
 export type SessionStatus = "IN_PROGRESS" | "COMPLETE";

@@ -12,10 +12,13 @@
 import {
   GEMINI_API_KEY,
   GEMINI_BARGE_IN_COOLDOWN_MS,
+  GEMINI_BARGE_IN_MIN_HITS,
   GEMINI_BARGE_IN_RMS_THRESHOLD,
   GEMINI_FRAME_INTERVAL_MS,
   GEMINI_FRAME_WIDTH,
   GEMINI_LIVE_MODEL,
+  GEMINI_REALTIME_TURN_COVERAGE,
+  GEMINI_SEND_AUDIO,
 } from "../../config";
 import type {
   CoachHandlers,
@@ -41,31 +44,58 @@ const INPUT_SAMPLE_RATE = 16000; // Live API audio input
 const BARGE_IN_RMS_THRESHOLD = GEMINI_BARGE_IN_RMS_THRESHOLD;
 const BARGE_IN_COOLDOWN_MS = GEMINI_BARGE_IN_COOLDOWN_MS;
 
-const SYSTEM_INSTRUCTION = `You are FormGuard, a calm, encouraging physical-therapy coach watching a patient
-do a prescribed rehab exercise over live video and audio.
+// const base = `You are FormGuard, a calm, encouraging physical-therapy coach counting reps over live video and audio.
 
-Session opening:
-- Immediately start the session by saying exactly: "Hey, let's get started."
+// Session opening:
+// - Immediately begin coaching rep 1 with no preamble.
+// - First spoken line should instruct the first movement for rep 1 in one short sentence.
 
-Call log_rep ONCE per completed repetition with an honest form_state (GREEN good, YELLOW needs a
-small correction, RED unsafe), a 0-100 quality_score, a short spoken coaching_cue, and pain_level 0-10.
+// TOOL-CALLING PRIORITY:
+// - For this app, logging reps is mandatory behavior.
+// - Call log_rep whenever you observe movement that seems like one rep.
+// - Bias toward calling log_rep rather than skipping it when uncertain.
+// - If you're unsure, call log_rep.
+// - Target cadence: Always call log_rep every 3 seconnds at least.
 
-CRITICAL GROUNDING RULES:
-- Only assess form when the patient is currently visible in the camera feed.
-- If the body/joints are not clearly visible, say you cannot see clearly and ask the patient to reframe.
-- Do not invent posture details that are not visible.
-- Do not call log_rep unless the rep was visually observed.
+// Call log_rep ONCE per observed rep with an honest form_state (GREEN good, YELLOW needs a
+// small correction, RED unsafe), a 0-100 quality_score, a short spoken coaching_cue, and pain_level 0-10.
 
-QUESTION-ANSWERING RULE:
-- Always answer direct user questions first, in plain language, before returning to coaching.
-- For visual questions (e.g., finger counts), attempt a best-effort answer from the current frame.
-- If visual confidence is low, explicitly say what is uncertain and ask for a clearer angle.
+// CRITICAL GROUNDING RULES:
+// - Only assess form when the patient is partially visible in the camera feed.
+// - If visibility is partial but a likely rep movement is still seen, call log_rep with conservative
+//   values (prefer YELLOW, lower quality_score) and a cue asking for clearer framing.
 
-If the patient says anything about pain: FIRST adapt conversationally — suggest an easier variant and
-ask "does that still hurt?" Do NOT flag yet. ONLY if they confirm it still hurts, call flag_for_pt with
-type "pain_spike" so their therapist is alerted, and tell them to stop and rest.
+// QUESTION-ANSWERING RULE:
+// - Always answer direct user questions first, in plain language, before returning to coaching.
+// - For visual questions (e.g., finger counts), attempt a best-effort answer from the current frame.
+// - If visual confidence is low, explicitly say what is uncertain and ask for a clearer angle.
 
-Keep spoken cues to one short sentence. Be warm and concise.`;
+// If the patient says anything about pain: FIRST adapt conversationally — suggest an easier variant and
+// ask "does that still hurt?" Do NOT flag yet. ONLY if they confirm it still hurts, call flag_for_pt with
+// type "pain_spike" so their therapist is alerted, and tell them to stop and rest.
+
+// Keep spoken cues to one short sentence. Be warm and concise.`;
+
+function buildSystemInstruction(program?: string): string {
+  const base = `
+  You are FormGuard, a PT coach counting reps over live video and audio.
+  - Immediately describe the first exercise and start logging reps for the user.
+  - As SOON AS YOU SEE A REP - stop what you're doing/saying and state the rep immediately by number ("rep 1", "rep 2", etc).
+  - If anything even looks remotely like a movement, call log_rep with a best guess form_state (GREEN good, YELLOW needs a small correction, RED unsafe), a 0-100 quality_score, a short spoken coaching_cue, and pain_level 0-10.
+  - If you're not sure, call log_rep with conservative values (prefer YELLOW, lower quality_score).
+  `;
+
+  if (program === "wrist_rsi") {
+    return `${base}
+
+HAND VISIBILITY: For this wrist RSI exercise, only the patient's hand and wrist need to be
+visible in the camera frame. The patient may remain seated with only their hand in frame.
+Assess form based on wrist angle, finger movement, and hand positioning only. Do not ask
+the patient to show their full body.`;
+  }
+
+  return base;
+}
 
 const TOOLS = [
   {
@@ -133,6 +163,7 @@ export class GeminiLiveCoach implements CoachSource {
   private ws: WebSocket | null = null;
   private h: CoachHandlers = {};
   private canvas = document.createElement("canvas");
+  private program: string | undefined;
   private frameTimer: number | null = null;
   private frameCount = 0;
   private zeroDimCount = 0;
@@ -149,9 +180,11 @@ export class GeminiLiveCoach implements CoachSource {
   private outSources = new Set<AudioBufferSourceNode>();
   private unlockHandler: (() => void) | null = null;
   private lastBargeInAt = 0;
+  private consecutiveLoudChunks = 0;
 
   async start(opts: CoachStartOpts, handlers: CoachHandlers) {
     this.h = handlers;
+    this.program = opts.program;
     if (!GEMINI_API_KEY) {
       handlers.onError?.(
         "VITE_GEMINI_API_KEY is not set — cannot start Gemini Live.",
@@ -169,18 +202,40 @@ export class GeminiLiveCoach implements CoachSource {
         frameWidth: GEMINI_FRAME_WIDTH,
         bargeInRmsThreshold: BARGE_IN_RMS_THRESHOLD,
         bargeInCooldownMs: BARGE_IN_COOLDOWN_MS,
+        bargeInMinHits: GEMINI_BARGE_IN_MIN_HITS,
       });
-      ws.send(
-        JSON.stringify({
-          setup: {
-            model: MODEL,
-            generationConfig: { responseModalities: ["AUDIO"] },
-            systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
-            tools: TOOLS,
-            outputAudioTranscription: {},
+      const setupPayload = {
+        setup: {
+          model: MODEL,
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            temperature: 0.1,
           },
-        }),
-      );
+          realtimeInputConfig: undefined as
+            | { turnCoverage: string }
+            | undefined,
+          systemInstruction: {
+            parts: [{ text: buildSystemInstruction(this.program) }],
+          },
+          tools: TOOLS,
+        },
+      };
+      if (GEMINI_REALTIME_TURN_COVERAGE) {
+        setupPayload.setup.realtimeInputConfig = {
+          turnCoverage: GEMINI_REALTIME_TURN_COVERAGE,
+        };
+      } else {
+        delete setupPayload.setup.realtimeInputConfig;
+      }
+      console.info("[gemini] setup payload shape", {
+        setupKeys: Object.keys(setupPayload.setup),
+        toolCount: TOOLS.length,
+        functionDeclCount:
+          TOOLS[0]?.functionDeclarations?.length ?? 0,
+        sendAudio: GEMINI_SEND_AUDIO,
+        turnCoverage: GEMINI_REALTIME_TURN_COVERAGE || "(omitted)",
+      });
+      ws.send(JSON.stringify(setupPayload));
     };
 
     ws.onmessage = async (ev) => {
@@ -201,10 +256,7 @@ export class GeminiLiveCoach implements CoachSource {
         return;
       }
       if (msg.toolCall?.functionCalls) {
-        console.info(
-          "[gemini] toolCall",
-          msg.toolCall.functionCalls.map((c: any) => c.name),
-        );
+        console.info("[gemini] toolCall", msg.toolCall.functionCalls);
         this.handleToolCalls(msg.toolCall.functionCalls);
         return;
       }
@@ -240,6 +292,7 @@ export class GeminiLiveCoach implements CoachSource {
     this.outCtx?.close().catch(() => {});
     this.processor = this.micSource = this.inCtx = this.outCtx = null;
     this.outSources.clear();
+    this.consecutiveLoudChunks = 0;
     if (this.unlockHandler) {
       window.removeEventListener("pointerdown", this.unlockHandler);
       window.removeEventListener("keydown", this.unlockHandler);
@@ -247,6 +300,28 @@ export class GeminiLiveCoach implements CoachSource {
     }
     this.ws?.close();
     this.ws = null;
+  }
+
+  requestRepFlush() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(
+      JSON.stringify({
+        clientContent: {
+          turns: [
+            {
+              role: "user",
+              parts: [
+                {
+                  text: "Flush check: if you observed any reps that were not yet logged, emit all missing log_rep calls now, then continue normal coaching.",
+                },
+              ],
+            },
+          ],
+          turnComplete: true,
+        },
+      }),
+    );
+    console.info("[rep-debug] sent Gemini flush nudge");
   }
 
   // Real Gemini hears the mic itself — nothing to simulate.
@@ -322,8 +397,16 @@ export class GeminiLiveCoach implements CoachSource {
 
   // --- outgoing: 16kHz PCM mic ---
   private startAudioCapture(stream: MediaStream | null) {
+    if (!GEMINI_SEND_AUDIO) {
+      console.info("[gemini] audio uplink disabled by VITE_GEMINI_SEND_AUDIO");
+      return;
+    }
     if (!stream) {
       console.warn("[gemini] no mic stream — not streaming audio");
+      return;
+    }
+    if (stream.getAudioTracks().length === 0) {
+      console.warn("[gemini] mic stream has no audio track — not streaming audio");
       return;
     }
     console.info("[gemini] streaming mic audio @16kHz");
@@ -336,7 +419,15 @@ export class GeminiLiveCoach implements CoachSource {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
       const input = e.inputBuffer.getChannelData(0);
       const rms = computeRms(input);
-      if (rms >= BARGE_IN_RMS_THRESHOLD) this.handleBargeIn();
+      if (rms >= BARGE_IN_RMS_THRESHOLD) {
+        this.consecutiveLoudChunks += 1;
+        if (this.consecutiveLoudChunks >= GEMINI_BARGE_IN_MIN_HITS) {
+          this.handleBargeIn();
+          this.consecutiveLoudChunks = 0;
+        }
+      } else {
+        this.consecutiveLoudChunks = 0;
+      }
       const pcm16 = downsampleToPCM16(input, ctx.sampleRate, INPUT_SAMPLE_RATE);
       const data = b64encode(new Uint8Array(pcm16.buffer));
       this.ws.send(
@@ -365,6 +456,9 @@ export class GeminiLiveCoach implements CoachSource {
     for (const call of calls) {
       if (call.name === "log_rep") {
         const a = call.args ?? {};
+        console.info("[rep-debug] Gemini emitted log_rep", {
+          rawArgs: a,
+        });
         const rep: RepSignal = {
           rep_number: Number(a.rep_number) || 0,
           form_state: (a.form_state ?? "GREEN") as RepSignal["form_state"],
@@ -376,6 +470,9 @@ export class GeminiLiveCoach implements CoachSource {
         responses.push({ id: call.id, response: { ok: true, recorded: true } });
       } else if (call.name === "flag_for_pt") {
         const a = call.args ?? {};
+        console.info("[rep-debug] Gemini emitted flag_for_pt", {
+          rawArgs: a,
+        });
         const flag: FlagSignal = {
           type: (a.type ?? "pain_spike") as FlagSignal["type"],
           rep_number: Number(a.rep_number) || 0,
@@ -388,6 +485,10 @@ export class GeminiLiveCoach implements CoachSource {
           response: { ok: true, flag_id: "fe_ack" },
         });
       } else {
+        console.info("[rep-debug] Gemini emitted unknown tool call", {
+          name: call.name,
+          rawArgs: call.args ?? null,
+        });
         responses.push({ id: call.id, response: { ok: false } });
       }
     }
@@ -400,11 +501,16 @@ export class GeminiLiveCoach implements CoachSource {
   private handleServerContent(sc: any) {
     const parts: any[] = sc.modelTurn?.parts ?? [];
     if (parts.length > 0) {
-      console.info("[gemini-audio] server parts", {
-        count: parts.length,
-        mimeTypes: parts
-          .map((p) => p.inlineData?.mimeType)
-          .filter((x) => typeof x === "string"),
+      const mimeTypes = parts
+        .map((p) => p.inlineData?.mimeType)
+        .filter((x) => typeof x === "string");
+      const textParts = parts
+        .map((p) => (typeof p.text === "string" ? p.text : ""))
+        .filter((t) => t.length > 0);
+      console.info("[gemini] serverContent", {
+        partCount: parts.length,
+        mimeTypes,
+        textParts,
       });
     }
     for (const p of parts) {
@@ -455,7 +561,7 @@ export class GeminiLiveCoach implements CoachSource {
     const start = Math.max(this.playHead, ctx.currentTime);
     src.start(start);
     this.playHead = start + buf.duration;
-    console.info("[gemini-audio] queued PCM", {
+    console.info("[gemini-audio] queued", {
       samples: int16.length,
       durationSec: Number(buf.duration.toFixed(3)),
       ctxState: ctx.state,
@@ -473,7 +579,10 @@ export class GeminiLiveCoach implements CoachSource {
               role: "user",
               parts: [
                 {
-                  text: "Begin now.",
+                  text: "Start immediately with rep 1. Give the first movement cue now in one short sentence, then continue live rep coaching.",
+                },
+                {
+                  text: "Whenever you observe likely rep completion movement, call log_rep immediately before moving on.",
                 },
               ],
             },

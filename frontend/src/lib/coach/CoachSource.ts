@@ -34,6 +34,7 @@ export interface CoachHandlers {
 export interface CoachStartOpts {
   sessionId: string;
   prescribedReps: number;
+  program?: string;
   video?: HTMLVideoElement | null;
   micStream?: MediaStream | null;
 }
@@ -41,6 +42,9 @@ export interface CoachStartOpts {
 export interface CoachSource {
   start(opts: CoachStartOpts, handlers: CoachHandlers): Promise<void> | void;
   stop(): void;
+  // Ask the live coach to flush any pending rep observations into tool calls.
+  // Optional because MockCoach emits reps on a fixed timer and has nothing to flush.
+  requestRepFlush?(): void;
   // Voice-only pain trigger. MockCoach uses it to drive the escalation in a demo;
   // GeminiLiveCoach ignores it (Gemini actually hears the mic).
   simulatePatientSays?(phrase: string): void;

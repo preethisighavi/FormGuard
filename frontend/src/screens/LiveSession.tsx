@@ -10,7 +10,18 @@ import { RepDial } from "../components/RepDial";
 import { StatusCluster } from "../components/StatusCluster";
 import { StopTakeover } from "../components/StopTakeover";
 import { VitalRing } from "../components/VitalRing";
-import { MOCK_GEMINI } from "../config";
+import {
+  GEMINI_SEND_AUDIO,
+  MIC_AUTO_GAIN_CONTROL,
+  MIC_ECHO_CANCELLATION,
+  MIC_NOISE_SUPPRESSION,
+  MOCK_GEMINI,
+  REP_MIN_INTERVAL_MS,
+  REP_MOTION_THRESHOLD,
+  REP_MOTION_THRESHOLD_MAX,
+  REP_MOTION_THRESHOLD_MIN,
+  REP_MOTION_THRESHOLD_RAW,
+} from "../config";
 import { getBackend, type CreateSessionRes } from "../lib/backend";
 import { createCoach, type CoachSource } from "../lib/coach";
 import { C, FONT, IDLE, STATE, type FormState } from "../styles";
@@ -39,15 +50,45 @@ export function LiveSession({
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
   const [camMsg, setCamMsg] = useState("starting camera…");
   const [framesSent, setFramesSent] = useState(0);
+  const [motionScoreUi, setMotionScoreUi] = useState(0);
+  const [liveStopped, setLiveStopped] = useState(false);
+  const [backendRepCount, setBackendRepCount] = useState(0);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const coachRef = useRef<CoachSource | null>(null);
   const repsSeen = useRef<Set<number>>(new Set());
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const lastAcceptedRepAt = useRef(0);
+  const lastRepSignalAt = useRef(0);
+  const repSignalsSeen = useRef(0);
+  const repSignalsForwarded = useRef(0);
+  const repSignalsRejected = useRef(0);
+  const backendSyncTicks = useRef(0);
+  const geminiFlushNudges = useRef(0);
+  const motionScore = useRef(0);
   const cueId = useRef(0);
   const backend = getBackend();
 
   const pushCue = (text: string, tone: Cue["tone"] = "normal") =>
     setCue({ id: ++cueId.current, text, tone });
+
+  useEffect(() => {
+    if (program !== "wrist_rsi") return;
+    pushCue("Wrist RSI session: wrist extension only, 5 total reps.", "normal");
+    // fire once when this session screen mounts
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const stopLiveStreaming = () => {
+    coachRef.current?.stop();
+    mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+    setCoachReady(false);
+    setSpeaking(false);
+    setMicStream(null);
+    setLiveStopped(true);
+    setCamMsg("Gemini Live stopped — no camera/mic frames are being sent.");
+    pushCue("Gemini Live stopped. You can end the session safely.", "warn");
+  };
 
   // --- bring up camera/mic, then start the coach ---
   useEffect(() => {
@@ -58,20 +99,32 @@ export function LiveSession({
 
     (async () => {
       try {
-        console.info("[camera-debug] requesting getUserMedia(video+audio)");
+        console.info("[camera-debug] requesting getUserMedia", {
+          video: true,
+          audio: GEMINI_SEND_AUDIO,
+        });
         stream = await navigator.mediaDevices.getUserMedia({
           video: true,
-          audio: true,
+          audio: GEMINI_SEND_AUDIO
+            ? {
+                noiseSuppression: MIC_NOISE_SUPPRESSION,
+                echoCancellation: MIC_ECHO_CANCELLATION,
+                autoGainControl: MIC_AUTO_GAIN_CONTROL,
+              }
+            : false,
         });
         if (cancelled) return;
+        mediaStreamRef.current = stream;
         logStreamDetails(stream, "getUserMedia success");
         removeVideoDebug = attachVideoDebugListeners(videoRef.current);
         clearHeartbeat = startVideoHeartbeat(videoRef.current, stream);
         await attachAndPlayStream(videoRef.current, stream);
         const hasVideo = stream.getVideoTracks().length > 0;
+        const hasAudio = stream.getAudioTracks().length > 0;
         console.info("[camera-debug] hasVideoTracks:", hasVideo);
+        console.info("[camera-debug] hasAudioTracks:", hasAudio);
         setCameraOk(hasVideo);
-        setMicStream(stream);
+        setMicStream(hasAudio ? stream : null);
         if (!hasVideo) setCamMsg("no camera track — coach still running");
       } catch (err) {
         // M10: camera/mic unavailable — coach still runs. Surface WHY.
@@ -83,30 +136,84 @@ export function LiveSession({
 
       const coach = createCoach();
       coachRef.current = coach;
+      console.info("[rep-gate] config", {
+        motionThreshold: REP_MOTION_THRESHOLD,
+        motionThresholdMin: REP_MOTION_THRESHOLD_MIN,
+        motionThresholdMax: REP_MOTION_THRESHOLD_MAX,
+        minIntervalMs: REP_MIN_INTERVAL_MS,
+      });
       coach.start(
         {
           sessionId: session.session_id,
           prescribedReps: session.prescribed_reps,
+          program,
           video: videoRef.current,
-          micStream: stream,
+          micStream: stream && stream.getAudioTracks().length > 0 ? stream : null,
         },
         {
           onReady: setCoachReady,
           onSpeaking: setSpeaking,
           onRep: (rep) => {
+            lastRepSignalAt.current = Date.now();
+            repSignalsSeen.current += 1;
+            console.info("[rep-debug] onRep signal received", {
+              repNumber: rep.rep_number,
+              totalSignalsSeen: repSignalsSeen.current,
+              motionScore: Number(motionScore.current.toFixed(4)),
+            });
+
+            // Always persist model-emitted reps. UI gating below is for local
+            // anti-noise display control, not backend recording.
+            repSignalsForwarded.current += 1;
+            backend
+              .logRep({ session_id: session.session_id, ...rep })
+              .then(() => {
+                console.info("[rep-debug] forwarded log_rep to backend", {
+                  repNumber: rep.rep_number,
+                  totalForwarded: repSignalsForwarded.current,
+                });
+              })
+              .catch((err) => {
+                console.error("[backend] logRep failed", {
+                  sessionId: session.session_id,
+                  repNumber: rep.rep_number,
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              });
+
+            const now = Date.now();
+            const dt = now - lastAcceptedRepAt.current;
+            const motionOk = motionScore.current >= REP_MOTION_THRESHOLD;
+            const intervalOk = dt >= REP_MIN_INTERVAL_MS;
+            if (!motionOk || !intervalOk) {
+              repSignalsRejected.current += 1;
+              console.warn("[rep-gate] rejected rep", {
+                repNumber: rep.rep_number,
+                motionScore: Number(motionScore.current.toFixed(4)),
+                motionThreshold: REP_MOTION_THRESHOLD,
+                msSinceLastAccepted: dt,
+                minIntervalMs: REP_MIN_INTERVAL_MS,
+                totalRejected: repSignalsRejected.current,
+                reason: !motionOk ? "low_motion" : "too_soon",
+              });
+              return;
+            }
+            lastAcceptedRepAt.current = now;
             setFormState(rep.form_state);
             setQuality(rep.quality_score);
             if (!repsSeen.current.has(rep.rep_number)) {
               repsSeen.current.add(rep.rep_number);
               setRepNumber((n) => Math.max(n, rep.rep_number));
             }
+            console.info("[rep-gate] accepted rep", {
+              repNumber: rep.rep_number,
+              motionScore: Number(motionScore.current.toFixed(4)),
+              motionThreshold: REP_MOTION_THRESHOLD,
+            });
             pushCue(
               rep.coaching_cue,
               rep.form_state === "YELLOW" ? "warn" : "normal",
             );
-            backend
-              .logRep({ session_id: session.session_id, ...rep })
-              .catch(() => {});
           },
           onCue: (text) => pushCue(text, "warn"),
           onFlag: (flag) => {
@@ -114,7 +221,13 @@ export function LiveSession({
             setFlagged(true);
             backend
               .flagForPt({ session_id: session.session_id, ...flag })
-              .catch(() => {});
+              .catch((err) => {
+                console.error("[backend] flagForPt failed", {
+                  sessionId: session.session_id,
+                  repNumber: flag.rep_number,
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              });
           },
           onComplete: () => onComplete(session.session_id),
           onError: (m) => pushCue(m, "warn"),
@@ -127,16 +240,80 @@ export function LiveSession({
       clearHeartbeat?.();
       removeVideoDebug?.();
       coachRef.current?.stop();
+      mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+      mediaStreamRef.current = null;
       stream?.getTracks().forEach((t) => t.stop());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.session_id]);
+
+  // --- lightweight motion estimator from successive video frames ---
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return;
+
+    let prev: Uint8ClampedArray | null = null;
+    let timer: number | null = null;
+    const sample = () => {
+      const w = video.videoWidth;
+      const h = video.videoHeight;
+      if (!w || !h) return;
+      canvas.width = 64;
+      canvas.height = 48;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+      if (prev) {
+        let sum = 0;
+        for (let i = 0; i < data.length; i += 4) {
+          const y0 = 0.299 * prev[i] + 0.587 * prev[i + 1] + 0.114 * prev[i + 2];
+          const y1 = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+          sum += Math.abs(y1 - y0);
+        }
+        const px = canvas.width * canvas.height;
+        const normalized = sum / (px * 255); // 0..1
+        motionScore.current = normalized;
+        setMotionScoreUi(normalized);
+      }
+      prev = new Uint8ClampedArray(data);
+    };
+    timer = window.setInterval(sample, 150);
+    return () => {
+      if (timer !== null) window.clearInterval(timer);
+    };
+  }, []);
 
   // --- session timer ---
   useEffect(() => {
     const t = window.setInterval(() => setElapsed((s) => s + 1), 1000);
     return () => window.clearInterval(t);
   }, []);
+
+  // --- rep-debug heartbeat when reps are not coming through ---
+  useEffect(() => {
+    const t = window.setInterval(() => {
+      if (!coachReady) return;
+      const now = Date.now();
+      const sinceLastSignal =
+        lastRepSignalAt.current === 0 ? null : now - lastRepSignalAt.current;
+      if (sinceLastSignal !== null && sinceLastSignal < 4000) return;
+      console.info("[rep-debug] waiting for rep signals", {
+        coachReady,
+        cameraOk,
+        framesSent,
+        motionScore: Number(motionScore.current.toFixed(4)),
+        motionThreshold: REP_MOTION_THRESHOLD,
+        repMinIntervalMs: REP_MIN_INTERVAL_MS,
+        totalSignalsSeen: repSignalsSeen.current,
+        totalForwarded: repSignalsForwarded.current,
+        totalRejected: repSignalsRejected.current,
+        msSinceLastSignal: sinceLastSignal,
+      });
+    }, 2000);
+    return () => window.clearInterval(t);
+  }, [cameraOk, coachReady, framesSent]);
 
   // --- Gemini transport/model debug HUD feed ---
   useEffect(() => {
@@ -161,6 +338,38 @@ export function LiveSession({
         .catch(() => {});
     const t = window.setInterval(poll, 3000);
     poll();
+    return () => window.clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.session_id]);
+
+  // --- authoritative rep reconciliation + periodic Gemini flush nudge ---
+  useEffect(() => {
+    const t = window.setInterval(() => {
+      backend
+        .getSession(session.session_id)
+        .then((r) => {
+          const reps = r.reps ?? [];
+          const count = reps.length;
+          setBackendRepCount(count);
+          backendSyncTicks.current += 1;
+          setRepNumber((n) => Math.max(n, count));
+          for (const rep of reps) {
+            if (typeof rep.rep_number === "number") repsSeen.current.add(rep.rep_number);
+          }
+
+          // Nudge Gemini only when backend moved ahead of UI signals.
+          if (count > repSignalsSeen.current) {
+            coachRef.current?.requestRepFlush?.();
+            geminiFlushNudges.current += 1;
+            console.info("[rep-debug] backend ahead, nudged Gemini flush", {
+              backendRepCount: count,
+              totalSignalsSeen: repSignalsSeen.current,
+              flushNudges: geminiFlushNudges.current,
+            });
+          }
+        })
+        .catch(() => {});
+    }, 1000);
     return () => window.clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.session_id]);
@@ -347,6 +556,36 @@ export function LiveSession({
         )}
       </div>
 
+      {!flagged && (
+        <button
+          onClick={stopLiveStreaming}
+          disabled={liveStopped}
+          style={{
+            position: "fixed",
+            left: "50%",
+            bottom: 24,
+            transform: "translateX(-50%)",
+            zIndex: 45,
+            border: "none",
+            borderRadius: 999,
+            padding: "10px 20px",
+            fontFamily: FONT,
+            fontSize: 14,
+            fontWeight: 700,
+            cursor: liveStopped ? "default" : "pointer",
+            background: liveStopped ? C.border : C.red,
+            color: liveStopped ? C.muted : "#1a0606",
+            boxShadow: "0 10px 28px rgba(0,0,0,0.28)",
+            transition: "transform 120ms ease, opacity 120ms ease",
+            opacity: liveStopped ? 0.92 : 1,
+          }}
+          aria-label="Stop Gemini Live streaming"
+          title="Stop Gemini Live streaming"
+        >
+          {liveStopped ? "Gemini Live stopped" : "Stop Gemini Live"}
+        </button>
+      )}
+
       {flagged && (
         <StopTakeover
           elapsedSec={elapsed}
@@ -371,6 +610,16 @@ export function LiveSession({
         }}
       >
         <div>frames_sent: {framesSent}</div>
+        <div>motion_score: {motionScoreUi.toFixed(4)}</div>
+        <div>motion_threshold: {REP_MOTION_THRESHOLD.toFixed(4)}</div>
+        <div>motion_threshold_raw: {REP_MOTION_THRESHOLD_RAW.toFixed(4)}</div>
+        <div>rep_min_interval_ms: {REP_MIN_INTERVAL_MS}</div>
+        <div>backend_reps: {backendRepCount}</div>
+        <div>rep_signals_seen: {repSignalsSeen.current}</div>
+        <div>rep_signals_forwarded: {repSignalsForwarded.current}</div>
+        <div>rep_signals_rejected: {repSignalsRejected.current}</div>
+        <div>backend_sync_ticks: {backendSyncTicks.current}</div>
+        <div>gemini_flush_nudges: {geminiFlushNudges.current}</div>
       </div>
     </div>
   );
@@ -500,20 +749,7 @@ function startVideoHeartbeat(
   video: HTMLVideoElement | null,
   stream: MediaStream,
 ): () => void {
-  if (!video) return () => {};
-  const id = window.setInterval(() => {
-    const track = stream.getVideoTracks()[0];
-    console.info("[camera-debug] heartbeat", {
-      streamActive: stream.active,
-      trackState: track?.readyState ?? null,
-      trackMuted: track?.muted ?? null,
-      trackEnabled: track?.enabled ?? null,
-      paused: video.paused,
-      readyState: video.readyState,
-      videoWidth: video.videoWidth,
-      videoHeight: video.videoHeight,
-      currentTime: Number(video.currentTime.toFixed(3)),
-    });
-  }, 2000);
-  return () => window.clearInterval(id);
+  void video;
+  void stream;
+  return () => {};
 }

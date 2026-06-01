@@ -12,6 +12,7 @@ const REPS: Record<string, number> = {
   "hip_rehab:clamshell": 15,
   "back_rehab:bird_dog": 10,
   "back_rehab:cat_cow": 10,
+  "wrist_rsi:wrist_extension": 5,
 };
 export function prescribedReps(program: string, exercise: string): number {
   return REPS[`${program}:${exercise}`] ?? 10;
@@ -22,6 +23,7 @@ export const EXERCISES: Record<Program, string[]> = {
   knee_rehab: ["squat", "sit_to_stand", "leg_raise"],
   hip_rehab: ["bridge", "clamshell"],
   back_rehab: ["bird_dog", "cat_cow"],
+  wrist_rsi: ["wrist_extension"],
 };
 
 // Pre-loaded PT dashboard patients (the plan asks for a seeded "John D.").

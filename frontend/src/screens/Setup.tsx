@@ -10,7 +10,7 @@ import {
 import { EXERCISES } from "../lib/backend/mock_seed";
 import { C, FONT } from "../styles";
 
-const PROGRAMS: Program[] = ["knee_rehab", "hip_rehab", "back_rehab"];
+const PROGRAMS: Program[] = ["knee_rehab", "hip_rehab", "back_rehab", "wrist_rsi"];
 
 export function Setup({
   onStart,
@@ -22,8 +22,8 @@ export function Setup({
   ) => void;
 }) {
   const [name, setName] = useState("Jane Doe");
-  const [program, setProgram] = useState<Program>("knee_rehab");
-  const [exercise, setExercise] = useState(EXERCISES["knee_rehab"][0]);
+  const [program, setProgram] = useState<Program>("wrist_rsi");
+  const [exercise, setExercise] = useState(EXERCISES["wrist_rsi"][0]);
   const [busy, setBusy] = useState(false);
   const backend = getBackend();
 
@@ -125,6 +125,9 @@ export function Setup({
               setExercise(EXERCISES[p][0]);
             }}
           >
+            <option disabled value="">
+              Type of workout
+            </option>
             {PROGRAMS.map((p) => (
               <option key={p} value={p}>
                 {p.replace("_", " ")}
